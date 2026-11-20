@@ -46,8 +46,22 @@ def get_db():
 
 db = get_db()
 
+# ─── مدير جلسات خادم MCP (يُملأ في أسفل الملف بعد بناء الخادم إن توفرت الحزمة) ───
+_mcp_session = None
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _lifespan(_app):
+    if _mcp_session is not None:
+        async with _mcp_session:
+            yield
+    else:
+        yield
+
 app = FastAPI(
     title="جامع الحديث النبوي الشريف — API",
+    lifespan=_lifespan,
     description="""
 قاعدة بيانات موحدة مبنية على برنامج **«جامع الحديث النبوي الشريف»** من شبكة المدارس الإسلامية (madarisweb.com)
 بنقل حرفي كامل من ملفات البرنامج الأصلية، دون أي تدخل:
@@ -66,7 +80,7 @@ app = FastAPI(
 
 ملاحظة: التصنيفات وكيانات الحديث (التخريجات) وعناقيد الأطراف وأحكام الأسانيد كما وضعها مختصو البرنامج — لا يد للذكاء الاصطناعي فيها.
 """,
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -134,8 +148,23 @@ def root():
             "بحث الرواة": "/narrators/search?q=...",
             "إسناد": "/isnad/{asn_id}",
             "إحصاءات": "/stats",
+            "الصحة": "/health",
         },
     }
+
+
+@app.get("/health", tags=["عام"])
+def health():
+    """فحص الصحة — لرندر (Health Check Path) وروبوتات الإيقاظ (UptimeRobot).
+
+    خفيف فوري: استعلام واحد على جدول meta الصغير لا يقرب جداول الملايين،
+    فيصلح للنقر كل 5 دقائق دون إثقال المعالج المجاني.
+    حقل version يميز النسخة المنتشرة بلمحة واحدة بعد أي نشر جديد."""
+    try:
+        db_ok = db.execute("SELECT 1 FROM meta LIMIT 1").fetchone() is not None
+    except Exception:
+        db_ok = False
+    return {"status": "ok" if db_ok else "degraded", "db": db_ok, "version": app.version}
 
 
 # تخزين مؤقت: أرقام الإحصاءات ثابتة لكل نسخة من القاعدة (تُحسب مرة واحدة فقط).
@@ -501,3 +530,139 @@ def hadith_isnads(rec_id: int):
         FROM record_narrators rn LEFT JOIN narrators n ON n.rowah_id=rn.rowah_id
         WHERE rn.rec_id=? ORDER BY rn.ord""", (rec_id,)).fetchall()
     return {"rec_id": rec_id, "سلسلة_الرواة": [row_to_dict(x) for x in rows]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# خادم MCP — ربط المساعدات الذكية (Claude بخطته المجانية، GLM، Cursor…) بالقاعدة
+# عن بُعد عبر الرابط:  https://<الخدمة>.onrender.com/mcp   بلا مفاتيح ولا تنصيب.
+# الأدوات أدناه تلتف على دوال الواجهة نفسها أعلاه (بحث/تخريج/رواة) مع اختصار
+# النتائج بما يناسب نافذة سياق المساعدات. وإن تعذّر استيراد الحزمة لأي سبب
+# عملت واجهة REST طبيعية دون أي تأثر (القسم كله داخل try/except).
+# ═════════════════════════════════════════════════════════════════════════════
+try:
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP(
+        "جامع الحديث النبوي الشريف",
+        instructions=(
+            "قاعدة «جامع الحديث النبوي الشريف» (شبكة المدارس الإسلامية madarisweb.com): "
+            "521,566 حديثًا وأثرًا مشكولًا في 401 كتابًا مسندًا، مع التخريجات وعناقيد "
+            "الأطراف وتراجم الرواة وأحكام الجرح والتعديل. البحث غير متحسس للتشكيل "
+            "والهمزات وعلامات الترقيم. لتخريج حديث: نادِ takhrij_by_phrase بعبارة من "
+            "متنه، أو search_hadith للبحث، ثم get_hadith للمتن الكامل وget_takhrij "
+            "للتخريج المفصل وget_narrator لترجمة الراوي."
+        ),
+        streamable_http_path="/",
+    )
+
+    def _short(t, n=220):
+        t = t or ""
+        return t if len(t) <= n else t[:n] + " …"
+
+    @mcp.tool()
+    def search_hadith(q: str, limit: int = 5, kind: str = None, rtype: str = "hadith") -> dict:
+        """بحث حر في نصوص الأحاديث والآثار والأطراف — غير متحسس للتشكيل والهمزات.
+        يعيد لكل نتيجة المعرّف (rec_id) والكتاب والتصنيف ومقتطفًا حول موضع المطابقة؛
+        استعمل المعرّف لاحقًا مع get_hadith أو get_takhrij.
+        kind اختياري: مرفوع | موقوف | مقطوع | قدسي — rtype: hadith | taraf | all."""
+        limit = max(1, min(int(limit or 5), 10))
+        r = search(q=q, kind=kind, book=None, rtype=rtype, page=1, size=limit)
+        items = [
+            {k: it.get(k) for k in ("rec_id", "serial", "rtype", "kind", "الكتاب", "مطابقة", "مقتطف")}
+            for it in r.get("النتائج", [])
+        ]
+        return {"الاستعلام": q, "الإجمالي": r.get("الإجمالي"), "النتائج": items}
+
+    @mcp.tool()
+    def takhrij_by_phrase(q: str, limit: int = 3) -> dict:
+        """تخريج حديث بعبارة من متنه مباشرة: يبحث عن أقرب المطابقات ثم يعيد لكل واحدة
+        ملخص تخريجها — الكتب التي روته وعدد رواياتها وظهوراتها — لتمييز الحديث ولفظه."""
+        limit = max(1, min(int(limit or 3), 5))
+        s = search(q=q, kind=None, book=None, rtype="hadith", page=1, size=limit)
+        out = []
+        for it in s.get("النتائج", []):
+            rec_id = it.get("rec_id")
+            if not rec_id:
+                continue
+            t = takhrij(rec_id=rec_id, size=50)
+            books, n_total = [], 0
+            for e in t.get("الكيانات", []):
+                n_total += int(e.get("عدد_الروايات") or 0)
+                for r in (e.get("الروايات") or []):
+                    b = r.get("الكتاب")
+                    if b and b not in books:
+                        books.append(b)
+            out.append({
+                "rec_id": rec_id, "الكتاب": it.get("الكتاب"), "kind": it.get("kind"),
+                "المقتطف": _short(it.get("مقتطف") or it.get("text"), 260),
+                "عدد_الظهورات": t.get("عدد_الظهورات"),
+                "عدد_روايات_التخريج": n_total,
+                "الكتب_التي_روته": books[:25],
+            })
+        return {"الاستعلام": q, "الإجمالي": s.get("الإجمالي"), "التخاريج": out}
+
+    @mcp.tool()
+    def get_hadith(rec_id: int) -> dict:
+        """المتن الكامل لحديث أو أثر بمعرّفه (rec_id)، مع رواة إسناده والتصنيف
+        والعناقيد وكيانات التخريج المرتبطة به والأحكام والتعليقات إن وجدت."""
+        h = hadith(rec_id=rec_id)
+        if isinstance(h, dict) and isinstance(h.get("text"), str):
+            h["text"] = _short(h["text"], 4000)
+        return h
+
+    @mcp.tool()
+    def get_takhrij(rec_id: int, size: int = 30) -> dict:
+        """تخريج السجل كاملًا: كيانات التخريج (كل من روى الحديث من الكتب مع رواياتهم)
+        وأطرافه في كتب الأطراف الأربعة مع نص الطرف."""
+        size = max(1, min(int(size or 30), 60))
+        t = takhrij(rec_id=rec_id, size=size)
+        ents = [
+            {
+                "entity_id": e.get("entity_id"),
+                "عدد_الروايات": e.get("عدد_الروايات"),
+                "الروايات": [
+                    {k: r.get(k) for k in ("rec_id", "kind", "الكتاب", "مقتطف")}
+                    for r in (e.get("الروايات") or [])
+                ],
+            }
+            for e in t.get("الكيانات", [])
+        ]
+        atr = []
+        for a in t.get("الأطراف", []):
+            txt = a.get("نص_الطرف")
+            if isinstance(txt, list) and txt:
+                first = txt[0]
+                txt = first.get("taraf_text") if isinstance(first, dict) else str(first)
+            atr.append({
+                "cluster_id": a.get("cluster_id"),
+                "نص_الطرف": _short(txt, 300),
+                "عدد_روايات_العنقود": len(a.get("الروايات") or []),
+            })
+        return {
+            "rec_id": t.get("rec_id"), "الكتاب": t.get("الكتاب"),
+            "عدد_الظهورات": t.get("عدد_الظهورات"),
+            "عدد_الكيانات": len(ents), "الكيانات": ents, "الأطراف": atr,
+        }
+
+    @mcp.tool()
+    def search_narrator(q: str, size: int = 10) -> dict:
+        """البحث عن راوٍ بالاسم — يعيد المعرّف واسمه الشائع وسنة وفاته وعدد أحاديثه."""
+        return narrators_search(q=q, size=max(1, min(int(size or 10), 20)))
+
+    @mcp.tool()
+    def get_narrator(rowah_id: int) -> dict:
+        """ترجمة راوٍ كاملة بمعرّفه: أسماؤه وطبقته وشيوخه وأحكام الجرح والتعديل."""
+        return narrator(rowah_id=rowah_id)
+
+    @mcp.tool()
+    def db_stats() -> dict:
+        """أرقام القاعدة: عدد الكتب والأحاديث والآثار والأطراف والتخريجات
+        والرواة وأحكام الجرح والتعديل والأسانيد."""
+        return stats()
+
+    # تطبيق MCP الفرعي (Starlette) يُلحق بمسار /mcp بعد كل مسارات REST
+    _mcp_asgi = mcp.streamable_http_app()
+    _mcp_session = mcp.session_manager.run()
+    app.mount("/mcp", _mcp_asgi)
+except Exception as _mcp_err:  # pragma: no cover
+    print("[MCP] خادم MCP غير متاح — واجهة REST تعمل طبيعيًا:", _mcp_err)
