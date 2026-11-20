@@ -138,25 +138,34 @@ def root():
     }
 
 
+# تخزين مؤقت: أرقام الإحصاءات ثابتة لكل نسخة من القاعدة (تُحسب مرة واحدة فقط).
+# قبل هذا التخزين كانت كل زيارة تعيد 12 استعلام COUNT على ملايين الصفوف
+# (~10–16 ثانية على المعالج المجاني في Render).
+_stats_cache = None
+
+
 @app.get("/stats", tags=["عام"])
 def stats():
-    q = lambda s: db.execute(s).fetchone()[0]
-    return {
-        "الكتب": q("SELECT COUNT(*) FROM books"),
-        "الأحاديث والآثار": q("SELECT COUNT(*) FROM records WHERE rtype='hadith'"),
-        "نصوص الأطراف": q("SELECT COUNT(*) FROM records WHERE rtype='taraf'"),
-        "عناوين الأبواب": q("SELECT COUNT(*) FROM records WHERE rtype='chapter'"),
-        "كيانات الحديث (التخريجات)": q("SELECT COUNT(*) FROM entities"),
-        "روايات مرتبطة بكيانات الحديث": q("SELECT COUNT(*) FROM entity_members"),
-        "عناقيد الأطراف": q("SELECT COUNT(*) FROM clusters"),
-        "الرواة": q("SELECT COUNT(*) FROM narrators"),
-        "أحكام الجرح والتعديل": q("SELECT COUNT(*) FROM narrator_rulings"),
-        "الأسانيد": q("SELECT COUNT(*) FROM asaneed"),
-        "الأحكام على الأحاديث": q("SELECT COUNT(*) FROM record_rulings"),
-        "تعليقات المحققين": q("SELECT COUNT(*) FROM record_comments"),
-        "التصنيفات": {r["kind"]: r["c"] for r in db.execute(
-            "SELECT kind, COUNT(*) c FROM records WHERE rtype='hadith' AND kind IS NOT NULL GROUP BY kind")},
-    }
+    global _stats_cache
+    if _stats_cache is None:
+        q = lambda s: db.execute(s).fetchone()[0]
+        _stats_cache = {
+            "الكتب": q("SELECT COUNT(*) FROM books"),
+            "الأحاديث والآثار": q("SELECT COUNT(*) FROM records WHERE rtype='hadith'"),
+            "نصوص الأطراف": q("SELECT COUNT(*) FROM records WHERE rtype='taraf'"),
+            "عناوين الأبواب": q("SELECT COUNT(*) FROM records WHERE rtype='chapter'"),
+            "كيانات الحديث (التخريجات)": q("SELECT COUNT(*) FROM entities"),
+            "روايات مرتبطة بكيانات الحديث": q("SELECT COUNT(*) FROM entity_members"),
+            "عناقيد الأطراف": q("SELECT COUNT(*) FROM clusters"),
+            "الرواة": q("SELECT COUNT(*) FROM narrators"),
+            "أحكام الجرح والتعديل": q("SELECT COUNT(*) FROM narrator_rulings"),
+            "الأسانيد": q("SELECT COUNT(*) FROM asaneed"),
+            "الأحكام على الأحاديث": q("SELECT COUNT(*) FROM record_rulings"),
+            "تعليقات المحققين": q("SELECT COUNT(*) FROM record_comments"),
+            "التصنيفات": {r["kind"]: r["c"] for r in db.execute(
+                "SELECT kind, COUNT(*) c FROM records WHERE rtype='hadith' AND kind IS NOT NULL GROUP BY kind")},
+        }
+    return _stats_cache
 
 
 @app.get("/books", tags=["الكتب"])
