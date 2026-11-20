@@ -80,7 +80,7 @@ app = FastAPI(
 
 ملاحظة: التصنيفات وكيانات الحديث (التخريجات) وعناقيد الأطراف وأحكام الأسانيد كما وضعها مختصو البرنامج — لا يد للذكاء الاصطناعي فيها.
 """,
-    version="1.3.0",
+    version="1.3.1",
 )
 
 
@@ -541,6 +541,7 @@ def hadith_isnads(rec_id: int):
 # ═════════════════════════════════════════════════════════════════════════════
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
 
     mcp = FastMCP(
         "جامع الحديث النبوي الشريف",
@@ -553,6 +554,23 @@ try:
             "للتخريج المفصل وget_narrator لترجمة الراوي."
         ),
         streamable_http_path="/",
+        # حماية DNS rebinding في mcp 1.27 تُفعَّل تلقائيًا بقائمة localhost فقط،
+        # فترد الخدمة المنشورة على رندر بـ421 «Invalid Host header» (شوهد على
+        # الإنتاج 2026-11-20) — هنا نضيف نطاق الخدمة صراحةً (مع localhost كي
+        # يبقى الاختبار المحلي يعمل). عملاء MCP من الخوادم لا يرسلون Origin،
+        # ولو استُعمل عميل ويب بنطاق آخر يومًا فأضفه إلى allowed_origins.
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "jame-hadith-api.onrender.com",
+                "jame-hadith-api.onrender.com:*",
+                "127.0.0.1:*", "localhost:*", "[::1]:*",
+            ],
+            allowed_origins=[
+                "https://jame-hadith-api.onrender.com",
+                "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+            ],
+        ),
     )
 
     def _short(t, n=220):
