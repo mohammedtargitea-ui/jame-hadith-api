@@ -2,21 +2,22 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt ./
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+COPY app.py .
 
-# سحب القاعدة المصلحة من سلّة البيانات العامة في هوغنغ (مرة واحدة عند البناء)
-# مع التحقق من الحجم بالبايت لضمان أنها النسخة المصلحة ذات الكيانات
-ARG DATA_BASE=https://huggingface.co/datasets/MoChihab/jame-hadith-data/resolve/main
-RUN curl -fsSL -o /app/jama_hadith.sqlite "$DATA_BASE/jama_hadith.sqlite" \
- && python3 -c "import os; s=os.path.getsize('/app/jama_hadith.sqlite'); print('DB size:', s); assert s == 1447137280, 'unexpected size %s' % s" \
- && ls -la /app
+# القاعدة (1.4GB) تُجلب عند البناء من الـDataset العام مباشرة —
+# لا حاجة لرفعها مع الكود في أي منصة (HF Space / Oracle / أي مضيف Docker).
+# إن حدَّثت القاعدة في الـDataset فحدِّث الرقم أدناه (حجم الملف بالبايت).
+RUN python -c "import urllib.request, os, sys; \
+    urllib.request.urlretrieve('https://huggingface.co/datasets/MoChihab/jame-alhadith/resolve/main/jama_hadith.sqlite', 'jama_hadith.sqlite'); \
+    sz = os.path.getsize('jama_hadith.sqlite'); \
+    print('DB size:', sz); \
+    sys.exit(0 if sz == 1447137280 else 1)"
 
-ENV PORT=10000
-CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+ENV JAMA_DB=/app/jama_hadith.sqlite
+
+EXPOSE 7860
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "2"]
