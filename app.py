@@ -1,324 +1,494 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-jame-hadith-server — خادم واجهة برمجية محلي لموسوعة جامع الحديث النبوي.
-يستنسخ واجهة التطبيق المنشور سابقًا على مودال بنفس المسارات:
-  GET /hadith/{hid}            — نص الحديث وبيانات كتابه
-  GET /hadith/{hid}/isnads     — سلاسل إسناد الحديث بأسماء الرواة ومعرفاتهم
-  GET /narrator/{id}           — بطاقة الراوي مع أحكام العلماء فيه
-  GET /narrators/search?q=     — البحث في الرواة الـ13,784
-  GET /search?q=&book=&limit=  — البحث النصي الكامل في 530,966 حديثًا
-  GET /health                  — فحص صحة الخادم والقاعدتين
+واجهة برمجية عربية لقاعدة «جامع الحديث النبوي الشريف» — شبكة المدارس الإسلامية
+نقل حرفي كامل: النصوص المشكولة، التصنيفات، عناقيد التخريج، تراجم الرواة، الجرح والتعديل.
 
-القواعد تُقرأ للقراءة فقط. ترتيب البحث عن كل قاعدة:
-  1) متغير البيئة (JAME_TEXT_DB، JAME_ANALYSIS_DB، JAME_RAWI_DB)
-  2) الملف بجوار هذا السكربت (وضع الاستضافة السحابية والفهرس المصغّر)
-  3) الموضع الافتراضي على القرص دي (وضع هذا الجهاز)
-
-التشغيل المحلي:
-  python -m uvicorn app:app --host 127.0.0.1 --port 8000
-التشغيل السحابي (مساحة هوغنغ فيس): يشغَّل تلقائيًا على المنفذ 7860.
+تشغيل محلي:  uvicorn app:app --host 0.0.0.0 --port 7860
 """
-import os
 import re
 import sqlite3
-from contextlib import closing
-from typing import Optional
+import json
+import os
+from fastapi import FastAPI, HTTPException, Query
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+def _find_db():
+    """تحديد مسار القاعدة: متغير البيئة، ثم مجلد api، ثم جذر المستودع، ثم مجلد التشغيل."""
+    env = os.environ.get("JAMA_DB")
+    if env and os.path.exists(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in (
+        os.path.join(here, "jama_hadith.sqlite"),
+        os.path.join(here, "..", "jama_hadith.sqlite"),
+        "jama_hadith.sqlite",
+    ):
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return os.path.join(here, "jama_hadith.sqlite")
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = _find_db()
 
+HARAKAT = re.compile(r'[\u064B-\u065F\u0670\u0640]')
 
-def _resolve_db(env_var: str, filename: str, fallback: str) -> str:
-    value = os.environ.get(env_var)
-    if value and os.path.exists(value):
-        return value
-    candidate = os.path.join(_HERE, filename)
-    if os.path.exists(candidate):
-        return candidate
-    return fallback
+def normalize(t: str) -> str:
+    t = HARAKAT.sub('', t or '')
+    t = t.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ٱ', 'ا')
+    t = t.replace('ى', 'ي').replace('ة', 'ه')
+    return t
 
+def get_db():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    con.execute("PRAGMA cache_size=-20000")
+    return con
 
-TEXT_DB = _resolve_db("JAME_TEXT_DB", "jame_hadith.db", r"D:\jame_hadith.db")
-ANALYSIS_DB = _resolve_db("JAME_ANALYSIS_DB", "jame_analysis.db", r"D:\jame_analysis.db")
-JW_RAWI_DB = _resolve_db("JAME_RAWI_DB", "rawi_index.db",
-                         r"D:\Jawami-AlKalem-GPT\jawami_alkalem.db")
-
-# مفتاح اختياري: إن ضُبط عبر متغير البيئة API_KEY فلط كل نداء واجهة أن يحمل
-# نفس المفتاح في معامل key (مثال: /hadith/148020?key=XXXX) — تستخدم في النشر العلني.
-API_KEY = os.environ.get("API_KEY", "").strip()
-
-
-def _guard(key: Optional[str] = Query(None)) -> None:
-    if API_KEY and key != API_KEY:
-        raise HTTPException(status_code=401, detail="مفتاح الواجهة غير صحيح أو ناقص")
-
-
-_GUARD = [Depends(_guard)] if API_KEY else []
+db = get_db()
 
 app = FastAPI(
-    title="jame-hadith API",
-    description="واجهة موسوعة جامع الحديث النبوي: النصوص والأسانيد والرواة والأحكام",
-    version="1.0.0",
+    title="جامع الحديث النبوي الشريف — API",
+    description="""
+قاعدة بيانات موحدة مبنية على برنامج **«جامع الحديث النبوي الشريف»** من شبكة المدارس الإسلامية (madarisweb.com)
+بنقل حرفي كامل من ملفات البرنامج الأصلية، دون أي تدخل:
+
+- **401 كتابًا مسندًا** + 4 كتب أطراف (تحفة الأشراف، أطراف مسند أحمد، نصب الراية، تلخيص الحبير)
+- **521,566 حديثًا وأثرًا** مشكولًا كما ورد في البرنامج
+- **التصنيفات الأصلية**: مرفوع / موقوف / مقطوع / قدسي (+ موقوف له حكم الرفع)
+- **كيانات الحديث (التخريجات)**: 54,200 كيانًا يربط روايات الحديث الواحد على مستوى
+  كل المصادر مع اتحاد المتن (أو أحد أجزائه) والصحابي — كما ربطها مختصو البرنامج
+  (هذه هي «تخريجات الحديث» في نافذة البرنامج: `/takhrij/{rec_id}`)
+- **عناقيد الأطراف**: 53,871 عنقودًا تربط روايات الحديث بكتب الأطراف الأربعة مع نص طرفه
+- **13,784 ترجمة راوٍ** مع 53,571 حكم جرح وتعديل
+- **270,794 إسنادًا** و 3.4 مليون رابط راوٍ بالأحاديث
+- **بحث كامل غير متحسس للتشكيل** (اكتب بلا تشكيل وستجد النص المشكول)،
+  وعلامات الترقيم لا تضر، ومطابقة العبارة المتتابعة مقدَّمة على تفرق الكلمات
+
+ملاحظة: التصنيفات وكيانات الحديث (التخريجات) وعناقيد الأطراف وأحكام الأسانيد كما وضعها مختصو البرنامج — لا يد للذكاء الاصطناعي فيها.
+""",
+    version="1.2.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── التطبيع: حذف التشكيل وتوحيد الهمزات (نفس منطق الخادم المحلي) ──
-DIAC = {ord(c): None for c in
-        "\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\u0670\u0640\u06d6\u06d7\u06d8\u06d9\u06da\u06db\u06dc"}
-HAMZA = {0x0623: 0x0627, 0x0625: 0x0627, 0x0622: 0x0627, 0x0671: 0x0627, 0x0649: 0x064a}
-NORM = {**DIAC, **HAMZA}
 
 
-def dev(s: str) -> str:
-    return (s or "").translate(NORM)
+def fts_words(q: str) -> list:
+    """كلمات الاستعلام بعد التطبيع وتنقية علامات الترقيم."""
+    t = ''.join(ch if ch.isalnum() else ' ' for ch in normalize(q or ''))
+    return t.split()
 
 
-def open_text() -> sqlite3.Connection:
-    con = sqlite3.connect(f"file:{TEXT_DB.replace(chr(92), '/')}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    return con
+def fts_query(q: str) -> str:
+    """تحويل استعلام حر إلى عبارة FTS آمنة: كلمات مقتبسة موصولة بـ AND.
 
-
-def open_ana() -> sqlite3.Connection:
-    con = sqlite3.connect(f"file:{ANALYSIS_DB.replace(chr(92), '/')}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    con.create_function("NORM", 1, lambda s: dev(s or ""))
-    return con
-
-
-def open_jw() -> sqlite3.Connection:
-    con = sqlite3.connect(f"file:{JW_RAWI_DB.replace(chr(92), '/')}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def fts_match(query: str) -> Optional[str]:
-    d = dev(query).strip()
-    words = [w for w in d.split() if w]
+    علامات الترقيم (، , ؛ : ؟ « » …) تُحال فراغات كما يفعل مُقطِّع الفهرس unicode61،
+    فلو بقيت في الاستعلام لبُحث عن رمز «،» نفسه كلمةً فيُصفَّر كل نتيجة
+    (كما وقع مع «في الإسلام ، فيفرق» قديمًا)."""
+    words = fts_words(q)
     if not words:
-        return None
-    return " ".join('"%s*"' % w for w in words)
+        raise HTTPException(400, "الاستعلام فارغ")
+    return ' AND '.join(f'"{w}"' for w in words)
 
 
-def parse_dashed(value: str):
-    """يفكك سلاسل بصيغة -عنصر-عنصر- إلى قائمة نظيفة."""
-    if not value:
-        return []
-    return [part for part in value.strip().strip("-").split("-") if part]
+def row_to_dict(row):
+    return {k: row[k] for k in row.keys()} if row is not None else None
 
 
-@app.get("/")
+def excerpt(text: str, q: str, width: int = 220) -> str:
+    """مقتطف حول أول تطابق (بعد التطبيع)."""
+    if not text:
+        return ""
+    nt = normalize(text)
+    qt = ''.join(ch if ch.isalnum() else ' ' for ch in normalize(q or ''))
+    words = [w for w in qt.split() if w]
+    pos = -1
+    for w in words:
+        pos = nt.find(w)
+        if pos >= 0:
+            break
+    if pos < 0:
+        return text[:width]
+    ratio = pos / max(1, len(nt))
+    p = int(ratio * len(text))
+    start = max(0, p - width // 3)
+    return ("…" if start > 0 else "") + text[start:start + width] + ("…" if start + width < len(text) else "")
+
+
+# ==================== المسارات ====================
+
+@app.get("/", tags=["عام"])
 def root():
+    meta = {r["key"]: r["value"] for r in db.execute("SELECT key, value FROM meta")}
     return {
-        "service": "jame-hadith API",
-        "version": "1.0.0",
-        "endpoints": [
-            "/hadith/{hid}",
-            "/hadith/{hid}/isnads",
-            "/narrator/{id}",
-            "/narrators/search?q=",
-            "/search?q=&book=&limit=",
-            "/health",
-        ],
+        "اسم القاعدة": "جامع الحديث النبوي الشريف — شبكة المدارس الإسلامية",
+        "المصدر": "الملف الرسمي من madarisweb.com (نقل حرفي كامل)",
+        "إحصاءات": meta,
+        "التوثيق": "/docs",
+        "المسارات": {
+            "الكتب": "/books",
+            "كتاب": "/books/{book_id}?page=1",
+            "حديث": "/hadith/{rec_id}",
+            "بحث": "/search?q=...&kind=مرفوع&book=سنن الدارمي",
+            "تخريجات الحديث": "/takhrij/{rec_id}",
+            "عنقود أطراف": "/cluster/{cluster_id}",
+            "كيان حديث": "/entity/{entity_id}",
+            "راوٍ": "/narrator/{rowah_id}",
+            "بحث الرواة": "/narrators/search?q=...",
+            "إسناد": "/isnad/{asn_id}",
+            "إحصاءات": "/stats",
+        },
     }
 
 
-@app.get("/health")
-def health():
-    out = {"status": "ok", "dbs": {}}
-    checks = (("text", TEXT_DB, open_text, "hadiths"),
-              ("analysis", ANALYSIS_DB, open_ana, "narrators"),
-              ("rawi_engine", JW_RAWI_DB, open_jw, "rawi"))
-    for name, path, opener, table in checks:
-        try:
-            with closing(opener()) as con:
-                n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            out["dbs"][name] = {"path": path, "ok": True, "rows": n}
-        except Exception as ex:
-            out["status"] = "degraded"
-            out["dbs"][name] = {"path": path, "ok": False, "error": str(ex)}
+@app.get("/stats", tags=["عام"])
+def stats():
+    q = lambda s: db.execute(s).fetchone()[0]
+    return {
+        "الكتب": q("SELECT COUNT(*) FROM books"),
+        "الأحاديث والآثار": q("SELECT COUNT(*) FROM records WHERE rtype='hadith'"),
+        "نصوص الأطراف": q("SELECT COUNT(*) FROM records WHERE rtype='taraf'"),
+        "عناوين الأبواب": q("SELECT COUNT(*) FROM records WHERE rtype='chapter'"),
+        "كيانات الحديث (التخريجات)": q("SELECT COUNT(*) FROM entities"),
+        "روايات مرتبطة بكيانات الحديث": q("SELECT COUNT(*) FROM entity_members"),
+        "عناقيد الأطراف": q("SELECT COUNT(*) FROM clusters"),
+        "الرواة": q("SELECT COUNT(*) FROM narrators"),
+        "أحكام الجرح والتعديل": q("SELECT COUNT(*) FROM narrator_rulings"),
+        "الأسانيد": q("SELECT COUNT(*) FROM asaneed"),
+        "الأحكام على الأحاديث": q("SELECT COUNT(*) FROM record_rulings"),
+        "تعليقات المحققين": q("SELECT COUNT(*) FROM record_comments"),
+        "التصنيفات": {r["kind"]: r["c"] for r in db.execute(
+            "SELECT kind, COUNT(*) c FROM records WHERE rtype='hadith' AND kind IS NOT NULL GROUP BY kind")},
+    }
+
+
+@app.get("/books", tags=["الكتب"])
+def books():
+    rows = db.execute("""
+        SELECT book_id, name, author, book_type, tabaqa, author_dod, hadith_count, n_records, n_hadith
+        FROM books ORDER BY book_id""").fetchall()
+    return {"العدد": len(rows), "الكتب": [row_to_dict(r) for r in rows]}
+
+
+@app.get("/books/{book_id}", tags=["الكتب"])
+def book(book_id: int, page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100),
+         rtype: str = Query("hadith", description="hadith | chapter | taraf | all")):
+    b = db.execute("SELECT * FROM books WHERE book_id=?", (book_id,)).fetchone()
+    if not b:
+        raise HTTPException(404, "الكتاب غير موجود")
+    cond = "" if rtype == "all" else "AND rtype=?"
+    args = [book_id] + ([rtype] if rtype != "all" else [])
+    total = db.execute(f"SELECT COUNT(*) FROM records WHERE book_id=? {cond}", args).fetchone()[0]
+    rows = db.execute(f"""
+        SELECT rec_id, serial, rtype, kind, text FROM records
+        WHERE book_id=? {cond} ORDER BY rec_id LIMIT ? OFFSET ?""",
+        args + [size, (page - 1) * size]).fetchall()
+    return {
+        "الكتاب": row_to_dict(b),
+        "الإجمالي": total,
+        "الصفحة": page,
+        "النتائج": [row_to_dict(r) for r in rows],
+    }
+
+
+@app.get("/hadith/{rec_id}", tags=["الأحاديث"])
+def hadith(rec_id: int):
+    r = db.execute("SELECT * FROM records WHERE rec_id=?", (rec_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "السجل غير موجود")
+    d = row_to_dict(r)
+    d["الكتاب"] = row_to_dict(db.execute(
+        "SELECT book_id, name, author FROM books WHERE book_id=?", (r["book_id"],)).fetchone())
+    d["الرواة"] = [row_to_dict(x) for x in db.execute("""
+        SELECT rn.rowah_id, n.summary_name, rn.ctx, rn.ord FROM record_narrators rn
+        LEFT JOIN narrators n ON n.rowah_id = rn.rowah_id
+        WHERE rn.rec_id=? ORDER BY rn.ord""", (rec_id,))]
+    d["الأحكام"] = [x["ruling"] for x in db.execute(
+        "SELECT ruling FROM record_rulings WHERE rec_id=?", (rec_id,))]
+    d["التعليقات"] = [x["comment"] for x in db.execute(
+        "SELECT comment FROM record_comments WHERE rec_id=?", (rec_id,))]
+    clusters = json.loads(d["cluster_ids"]) if d["cluster_ids"] else []
+    d["العناقيد"] = []
+    for cid in clusters:
+        cl = db.execute("SELECT * FROM clusters WHERE cluster_id=?", (cid,)).fetchone()
+        if cl:
+            d["العناقيد"].append(row_to_dict(cl))
+    if clusters:
+        cid = clusters[0]
+        d["روايات_العنقود_الأساسي"] = [
+            row_to_dict(x) for x in db.execute("""
+                SELECT r.rec_id, r.serial, r.kind, b.name AS الكتاب
+                FROM cluster_members cm JOIN records r ON r.rec_id=cm.rec_id
+                JOIN books b ON b.book_id=r.book_id
+                WHERE cm.cluster_id=? AND cm.is_primary=1 AND r.rtype='hadith'
+                ORDER BY r.rec_id""", (cid,))]
+    # تخريجات الحديث: كيانات المتن التي ينتمي إليها السجل
+    entities = json.loads(d["entity_ids"]) if d["entity_ids"] else []
+    d["كيانات_الحديث"] = []
+    for eid in entities:
+        n = db.execute("SELECT n_members FROM entities WHERE entity_id=?", (eid,)).fetchone()
+        if n:
+            d["كيانات_الحديث"].append({"entity_id": eid, "عدد_الروايات": n["n_members"]})
+    if entities:
+        d["التخريجات_على_مستوى_المصادر"] = [
+            row_to_dict(x) for x in db.execute("""
+                SELECT DISTINCT r.rec_id, r.serial, r.kind, b.name AS الكتاب, r.text
+                FROM entity_members em JOIN records r ON r.rec_id=em.rec_id
+                JOIN books b ON b.book_id=r.book_id
+                WHERE em.entity_id IN (%s) AND r.rtype='hadith'
+                ORDER BY r.rec_id""" % ",".join("?" * len(entities)), entities)]
+    return d
+
+
+@app.get("/search", tags=["البحث"])
+def search(q: str, kind: str = Query(None, description="مرفوع | موقوف | مقطوع | قدسي"),
+           book: str = Query(None, description="اسم الكتاب (جزء من الاسم)"),
+           rtype: str = Query("hadith", description="hadith | taraf | all"),
+           page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100)):
+    """بحث حر في نصوص الأحاديث والأطراف — غير متحسس للتشكيل والهمزات وعلامات الترقيم.
+    ترتيب النتائج: مطابقة «العبارة المتتابعة» (الكلمات بالترتيب نفسه متجاورة)
+    مقدَّمة على مطابقة «كل الكلمات» وإن تفرقت في النص."""
+    words = fts_words(q)
+    if not words:
+        raise HTTPException(400, "الاستعلام فارغ")
+    fts_q = ' AND '.join(f'"{w}"' for w in words)
+    conds = []
+    args = []
+    if rtype != "all":
+        conds.append("r.rtype=?")
+        args.append(rtype)
+    if kind:
+        conds.append("r.kind=?")
+        args.append(kind)
+    if book:
+        conds.append("b.name LIKE ?")
+        args.append(f"%{book}%")
+    where = (" AND " + " AND ".join(conds)) if conds else ""
+    # CROSS JOIN يمنع مخطِّط SQLite (قبل الإصدار 3.53) من مسح جدول records
+    # كاملًا (521 ألف صف) وفحص كل صف ضد الفهرس — خطة تستغرق ~10 ثوانٍ لكل
+    # استعلام — ويُجبر فهرس FTS5 على قيادة الاستعلام (أجزاء من الثانية).
+    # لا يغيّر النتائج في شيء (INNER JOIN داخلي بكل الأحوال).
+    base = f"""
+        FROM records_fts f
+        CROSS JOIN records r ON r.rec_id=f.rowid
+        CROSS JOIN books b ON b.book_id=r.book_id
+        WHERE records_fts MATCH ? {where}"""
+    total = db.execute(f"SELECT COUNT(*) FROM (SELECT f.rowid {base} LIMIT 20000)",
+                       [fts_q] + args).fetchone()[0]
+
+    # (أ) مطابقة العبارة المتتابعة: كل كلمات الاستعلام بالترتيب نفسه متجاورة في النص
+    phrase_q = '"' + ' '.join(words) + '"' if len(words) > 1 else None
+    phrase_ids = []
+    if phrase_q and total:
+        n_ph = db.execute(f"SELECT COUNT(*) FROM (SELECT f.rowid {base} LIMIT 20000)",
+                          [phrase_q] + args).fetchone()[0]
+        if 0 < n_ph <= 5000:
+            phrase_ids = [x[0] for x in db.execute(
+                f"SELECT f.rowid {base} ORDER BY r.rec_id LIMIT 5000",
+                [phrase_q] + args).fetchall()]
+    phrase_set = set(phrase_ids)
+
+    # (ب) تقطيع الصفحة: نتائج العبارة أولًا ثم باقي المطابقات بترتيب الكتب
+    start = (page - 1) * size
+    end = start + size
+    if start < len(phrase_ids):
+        head = phrase_ids[start:end]
+        bag_from, bag_to = 0, end - len(phrase_ids)
+    else:
+        head = []
+        bag_from, bag_to = start - len(phrase_ids), end - len(phrase_ids)
+    tail = []
+    if bag_to > 0:
+        excl = ""
+        bag_args = [fts_q] + args
+        if phrase_set:
+            excl = " AND r.rec_id NOT IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)"
+            bag_args.append(phrase_q)
+        tail = [x[0] for x in db.execute(f"""
+            SELECT f.rowid {base} {excl}
+            ORDER BY r.rec_id LIMIT ? OFFSET ?""",
+            bag_args + [max(0, bag_to - bag_from), max(0, bag_from)]).fetchall()]
+
+    page_ids = head + tail
+    out = []
+    if page_ids:
+        rows = db.execute(f"""
+            SELECT r.rec_id, r.serial, r.rtype, r.kind, r.text, b.name AS الكتاب
+            FROM records r JOIN books b ON b.book_id=r.book_id
+            WHERE r.rec_id IN ({','.join('?' * len(page_ids))})""",
+            page_ids).fetchall()
+        by_id = {r["rec_id"]: r for r in rows}
+        for rid in page_ids:
+            r = by_id.get(rid)
+            if r is None:
+                continue
+            d = row_to_dict(r)
+            d["مطابقة"] = "عبارة متتابعة" if rid in phrase_set else "كل الكلمات"
+            d["مقتطف"] = excerpt(r["text"], q)
+            out.append(d)
+    return {"الاستعلام": q, "الإجمالي": total,
+            "مطابقة_العبارة_المتتابعة": len(phrase_ids),
+            "الصفحة": page, "النتائج": out}
+
+
+@app.get("/takhrij/{rec_id}", tags=["التخريج"])
+def takhrij(rec_id: int, size: int = Query(100, ge=1, le=500)):
+    """نافذة «تخريجات الحديث» كما في البرنامج: مكررات الحديث الحالي على مستوى جميع
+    مصادر البرنامج، مع اتحاد المتن (أو أحد أجزائه) والصحابي راوي الحديث.
+
+    هذا الربط صنعه مختصو البرنامج يدويًا (روابط كيانات المتن)، فهو يلتقط الروايات
+    مختلفة الألفاظ أيضًا (مثل «أن يتقنه»/«أن يحكمه») التي لا يلتقطها البحث النصي.
+    """
+    r = db.execute("SELECT * FROM records WHERE rec_id=?", (rec_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "السجل غير موجود")
+    entities = json.loads(r["entity_ids"]) if r["entity_ids"] else []
+    out = {
+        "rec_id": rec_id,
+        "الكتاب": db.execute("SELECT name FROM books WHERE book_id=?", (r["book_id"],)).fetchone()["name"],
+        "عدد_الأحاديث": len(entities),
+        "الكيانات": [],
+        "الأطراف": [],
+    }
+    seen = set()
+    total = 0
+    for eid in entities:
+        n = db.execute("SELECT n_members FROM entities WHERE entity_id=?", (eid,)).fetchone()
+        rows = db.execute("""
+            SELECT r.rec_id, r.serial, r.kind, b.name AS الكتاب, r.text
+            FROM entity_members em JOIN records r ON r.rec_id=em.rec_id
+            JOIN books b ON b.book_id=r.book_id
+            WHERE em.entity_id=? AND r.rtype='hadith'
+            ORDER BY r.rec_id LIMIT ?""", (eid, size)).fetchall()
+        group = {"entity_id": eid, "عدد_الروايات": n["n_members"] if n else 0, "الروايات": []}
+        for x in rows:
+            d = row_to_dict(x)
+            d["مقتطف"] = excerpt(x["text"], "")
+            group["الروايات"].append(d)
+            if x["rec_id"] not in seen:
+                seen.add(x["rec_id"])
+                total += 1
+        out["الكيانات"].append(group)
+    out["عدد_الظهورات"] = total
+    # عناقيد الأطراف (إن وجدت) — كما في نافذة التخريج بالبرنامج أيضًا
+    clusters = json.loads(r["cluster_ids"]) if r["cluster_ids"] else []
+    for cid in clusters:
+        cl = db.execute("SELECT * FROM clusters WHERE cluster_id=?", (cid,)).fetchone()
+        if not cl:
+            continue
+        taraf = [row_to_dict(x) for x in db.execute("""
+            SELECT ct.taraf_rec_id, ct.taraf_text, b.name AS المصدر
+            FROM cluster_taraf ct
+            JOIN records r ON r.rec_id=ct.taraf_rec_id JOIN books b ON b.book_id=r.book_id
+            WHERE ct.cluster_id=?""", (cid,))]
+        members = [row_to_dict(x) for x in db.execute("""
+            SELECT r.rec_id, r.serial, r.kind, b.name AS الكتاب
+            FROM cluster_members cm JOIN records r ON r.rec_id=cm.rec_id
+            JOIN books b ON b.book_id=r.book_id
+            WHERE cm.cluster_id=? AND r.rtype='hadith'
+            ORDER BY r.rec_id""", (cid,))]
+        out["الأطراف"].append({
+            "cluster_id": cid,
+            "نص_الطرف": taraf,
+            "الروايات": members,
+        })
     return out
 
 
-@app.get("/hadith/{hid}", dependencies=_GUARD)
-def get_hadith(hid: int):
-    with closing(open_text()) as con:
-        r = con.execute(
-            "SELECT h.hid, h.book_id, h.num, h.text, b.title, b.death "
-            "FROM hadiths h JOIN books b ON b.id = h.book_id WHERE h.hid = ?", (hid,)
-        ).fetchone()
-        if not r:
-            raise HTTPException(status_code=404, detail=f"لا يوجد حديث برقم {hid}")
-        hadith_count = con.execute(
-            "SELECT COUNT(*) FROM hadiths WHERE book_id = ?", (r["book_id"],)).fetchone()[0]
+@app.get("/entity/{entity_id}", tags=["التخريج"])
+def entity(entity_id: int, size: int = Query(100, ge=1, le=500)):
+    """كيان الحديث: كل رواياته على مستوى مصادر البرنامج (المكررات بتوحيد المتن/جزئه والصحابي)."""
+    e = db.execute("SELECT * FROM entities WHERE entity_id=?", (entity_id,)).fetchone()
+    if not e:
+        raise HTTPException(404, "الكيان غير موجود")
+    rows = db.execute("""
+        SELECT r.rec_id, r.serial, r.kind, b.name AS الكتاب, r.text
+        FROM entity_members em JOIN records r ON r.rec_id=em.rec_id
+        JOIN books b ON b.book_id=r.book_id
+        WHERE em.entity_id=? AND r.rtype='hadith'
+        ORDER BY r.rec_id LIMIT ?""", (entity_id, size)).fetchall()
     return {
-        "hid": r["hid"],
-        "book_id": r["book_id"],
-        "num": r["num"],
-        "text": r["text"],
-        "book": {"id": r["book_id"], "title": r["title"], "author_death": r["death"],
-                 "hadiths_count": hadith_count},
+        "entity_id": entity_id,
+        "عدد_الروايات": e["n_members"],
+        "الروايات": [row_to_dict(x) for x in rows],
     }
 
 
-@app.get("/hadith/{hid}/isnads", dependencies=_GUARD)
-def get_isnads(hid: int):
-    """سلاسل إسناد الحديث، ومع كل راوٍ معرفاته في جدول جوامع الكلم ورتبته وسنة وفاته.
-
-    ملاحظة: معرّفات rawi_ids تشير إلى جدول الرواة في قاعدة المحرك
-    (jawami_alkalem.db) لا إلى جدول الرواة في قاعدة التحليل.
-    """
-    with closing(open_ana()) as con:
-        chains = con.execute(
-            "SELECT id, rawi_id, narrators, rawi_ids FROM chains WHERE rawi_id = ?", (hid,)
-        ).fetchall()
-        if not chains:
-            raise HTTPException(status_code=404, detail=f"لا توجد سلاسل إسناد للحديث {hid}")
-        all_ids = set()
-        out = []
-        for c in chains:
-            names = parse_dashed(c["narrators"])
-            rids = [int(x) for x in parse_dashed(c["rawi_ids"]) if x.isdigit()]
-            all_ids.update(rids)
-            out.append({"chain_id": c["id"],
-                        "isnad": " ← ".join(names),
-                        "narrators": names,
-                        "rawi_ids": rids})
-    details = {}
-    if all_ids:
-        known = sorted(x for x in all_ids if 1 <= x <= 999999)
-        step = 500
-        with closing(open_jw()) as con:
-            for i in range(0, len(known), step):
-                chunk = known[i:i + step]
-                marks = ",".join("?" * len(chunk))
-                for row in con.execute(
-                        f"SELECT rawi_id, name, alt_name, rank_text, wafat FROM rawi "
-                        f"WHERE rawi_id IN ({marks})", chunk):
-                    rid_int = int(row["rawi_id"])  # العمود مخزّن كنص في القاعدة
-                    details[rid_int] = {
-                        "rawi_id": rid_int, "name": row["name"],
-                        "alt_name": row["alt_name"], "rank_text": row["rank_text"],
-                        "wafat": row["wafat"]}
-    for chain in out:
-        chain["rawi_details"] = [details.get(rid) for rid in chain["rawi_ids"]]
-    return {"hid": hid, "chains_count": len(chains), "chains": out}
-
-
-@app.get("/narrator/{nid}", dependencies=_GUARD)
-def get_narrator(nid: int):
-    with closing(open_ana()) as con:
-        r = con.execute("SELECT * FROM narrators WHERE id = ?", (nid,)).fetchone()
-        if not r:
-            raise HTTPException(status_code=404, detail=f"لا يوجد راوٍ برقم {nid}")
-        judgments = [{"scholar": row["scholar"], "judgment": row["judgment"]}
-                     for row in con.execute(
-                         "SELECT scholar, judgment FROM judgments WHERE rawi_id = ? ORDER BY id",
-                         (nid,))]
-        chains_count = con.execute(
-            "SELECT COUNT(*) FROM chains WHERE rawi_id = ?", (nid,)).fetchone()[0]
+@app.get("/cluster/{cluster_id}", tags=["التخريج"])
+def cluster(cluster_id: int):
+    """عنقود الأطراف: نص الطرف من كتب الأطراف الأربعة + كل رواياته عبر الكتب (كما في نافذة التخريج بالبرنامج)."""
+    cl = db.execute("SELECT * FROM clusters WHERE cluster_id=?", (cluster_id,)).fetchone()
+    if not cl:
+        raise HTTPException(404, "العنقود غير موجود")
+    taraf = [row_to_dict(x) for x in db.execute("""
+        SELECT ct.taraf_rec_id, ct.taraf_text, b.name AS المصدر
+        FROM cluster_taraf ct
+        JOIN records r ON r.rec_id=ct.taraf_rec_id JOIN books b ON b.book_id=r.book_id
+        WHERE ct.cluster_id=?""", (cluster_id,))]
+    primary = [row_to_dict(x) for x in db.execute("""
+        SELECT r.rec_id, r.serial, r.kind, r.text, b.name AS الكتاب
+        FROM cluster_members cm JOIN records r ON r.rec_id=cm.rec_id
+        JOIN books b ON b.book_id=r.book_id
+        WHERE cm.cluster_id=? AND cm.is_primary=1 AND r.rtype='hadith'
+        ORDER BY r.rec_id""", (cluster_id,))]
+    related = [row_to_dict(x) for x in db.execute("""
+        SELECT r.rec_id, r.serial, r.kind, r.text, b.name AS الكتاب
+        FROM cluster_members cm JOIN records r ON r.rec_id=cm.rec_id
+        JOIN books b ON b.book_id=r.book_id
+        WHERE cm.cluster_id=? AND cm.is_primary=0 AND r.rtype='hadith'
+        ORDER BY r.rec_id""", (cluster_id,))]
     return {
-        "narrator_id": r["id"],
-        "full_name": r["full_name"],
-        "name": r["name"],
-        "kunya": r["kunya"],
-        "laqab": r["laqab"],
-        "nasab": r["nasab"],
-        "shuhra": r["shuhra"],
-        "view_name": r["view_name"],
-        "birth": r["birth"],
-        "death": r["death"],
-        "judgments": judgments,
-        "chains_count": chains_count,
+        "cluster_id": cluster_id,
+        "عدد_الروايات_الأساسية": cl["n_primary"],
+        "عدد_المرتبطة": cl["n_related"],
+        "نص_الطرف": taraf,
+        "الروايات": primary,
+        "الروايات_المرتبطة": related,
     }
 
 
-@app.get("/narrators/search", dependencies=_GUARD)
-def search_narrators(q: str = Query(..., min_length=1, max_length=200),
-                     limit: int = Query(10, ge=1, le=40)):
-    nq = dev(q.strip())
-    with closing(open_ana()) as con:
-        rows = con.execute(
-            "SELECT id, full_name, shuhra, birth, death FROM narrators "
-            "WHERE NORM(full_name) LIKE ? OR NORM(name) LIKE ? OR NORM(shuhra) LIKE ? "
-            "ORDER BY id LIMIT ?",
-            (f"%{nq}%", f"%{nq}%", f"%{nq}%", limit)).fetchall()
-        total = con.execute(
-            "SELECT COUNT(*) FROM narrators "
-            "WHERE NORM(full_name) LIKE ? OR NORM(name) LIKE ? OR NORM(shuhra) LIKE ?",
-            (f"%{nq}%", f"%{nq}%", f"%{nq}%")).fetchone()[0]
-    return {
-        "query": q,
-        "total_matches": total,
-        "count_shown": len(rows),
-        "results": [{"narrator_id": r["id"], "full_name": r["full_name"],
-                     "shuhra": r["shuhra"], "birth": r["birth"], "death": r["death"]}
-                    for r in rows],
-    }
+@app.get("/narrator/{rowah_id}", tags=["الرواة"])
+def narrator(rowah_id: int):
+    """ترجمة الراوي كاملة كما في البرنامج + أحكام الجرح والتعديل."""
+    n = db.execute("SELECT * FROM narrators WHERE rowah_id=?", (rowah_id,)).fetchone()
+    if not n:
+        raise HTTPException(404, "الراوي غير موجود")
+    d = row_to_dict(n)
+    d["الجرح_والتعديل"] = [row_to_dict(x) for x in db.execute(
+        "SELECT scholar, ruling FROM narrator_rulings WHERE rowah_id=?", (rowah_id,))]
+    return d
 
 
-@app.get("/search", dependencies=_GUARD)
-def search_hadith(q: str = Query(..., min_length=1, max_length=500),
-                  book: Optional[str] = Query(None, max_length=200),
-                  limit: int = Query(10, ge=1, le=50)):
-    m = fts_match(q)
-    if not m:
-        raise HTTPException(status_code=400, detail="ادخل كلمات للبحث")
-    sql = ("SELECT h.hid, h.num, h.text, b.title, b.id AS book_id, "
-           "snippet(hadiths_fts, 0, '»', '«', '…', 20) AS snip "
-           "FROM hadiths_fts f JOIN hadiths h ON h.hid = f.rowid "
-           "JOIN books b ON b.id = h.book_id WHERE hadiths_fts MATCH ?")
-    params = [m]
-    if book:
-        sql += " AND b.title LIKE ?"
-        params.append(f"%{dev(book)}%")
-    sql += " LIMIT ?"
-    params.append(limit)
-    with closing(open_text()) as con:
-        rows = con.execute(sql, params).fetchall()
-        total = None
-        if len(m.split()) <= 2:
-            csql = ("SELECT count(*) FROM hadiths_fts f JOIN hadiths h ON h.hid = f.rowid "
-                    "JOIN books b ON b.id = h.book_id WHERE hadiths_fts MATCH ?")
-            cparams = [m]
-            if book:
-                csql += " AND b.title LIKE ?"
-                cparams.append(f"%{dev(book)}%")
-            total = con.execute(csql, cparams).fetchone()[0]
-    return {
-        "query": q,
-        "total_matches": total,
-        "count_shown": len(rows),
-        "results": [{"hid": r["hid"], "book_id": r["book_id"], "book": r["title"],
-                     "num": r["num"], "snippet": r["snip"], "text": r["text"]}
-                    for r in rows],
-    }
+@app.get("/narrators/search", tags=["الرواة"])
+def narrators_search(q: str, size: int = Query(20, ge=1, le=100)):
+    """بحث في أسماء الرواة (الاسم المشهور أو الكاملة)."""
+    nq = normalize(q)
+    like = f"%{nq}%"
+    rows = db.execute("""
+        SELECT rowah_id, summary_name, view_name, dod, hadith_freq FROM narrators
+        WHERE replace(replace(replace(replace(replace(summary_name,'أ','ا'),'إ','ا'),'آ','ا'),'ى','ي'),'ة','ه') LIKE ?
+        ORDER BY hadith_freq DESC LIMIT ?""",
+        (like, size)).fetchall()
+    if not rows:
+        rows = db.execute("""
+            SELECT rowah_id, summary_name, view_name, dod, hadith_freq FROM narrators
+            WHERE view_name LIKE ? ORDER BY hadith_freq DESC LIMIT ?""", (f"%{q}%", size)).fetchall()
+    return {"الاستعلام": q, "النتائج": [row_to_dict(r) for r in rows]}
 
 
-# ── صفحة غراديو للاستضافة السحابية (تُتجاهل محليًا إن لم تكن غراديو مثبتة) ──
-try:
-    import gradio as gr
-
-    with gr.Blocks(title="جامع الحديث — API") as _demo:
-        gr.Markdown("## واجهة موسوعة جامع الحديث النبوي")
-        gr.Markdown(
-            "التوثيق التفاعلي على المسار `/docs`. "
-            "المسارات: `/hadith/{hid}` و `/hadith/{hid}/isnads` و "
-            "`/narrator/{id}` و `/narrators/search?q=` و `/search?q=` و `/health`"
-        )
-    app = gr.mount_gradio_app(app, _demo, path="/ui")
-except ImportError:
-    pass
+@app.get("/isnad/{asn_id}", tags=["الأسانيد"])
+def isnad(asn_id: int):
+    a = db.execute("SELECT * FROM asaneed WHERE asn_id=?", (asn_id,)).fetchone()
+    if not a:
+        raise HTTPException(404, "الإسناد غير موجود")
+    return row_to_dict(a)
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "7860")))
+@app.get("/hadith/{rec_id}/isnads", tags=["الأسانيد"])
+def hadith_isnads(rec_id: int):
+    """أسانيد الحديث: سلسلة معرفات الرواة وأسماؤهم بالترتيب."""
+    r = db.execute("SELECT rec_id FROM records WHERE rec_id=?", (rec_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "السجل غير موجود")
+    rows = db.execute("""
+        SELECT rn.rowah_id, n.summary_name, n.view_name, rn.ctx, rn.ord
+        FROM record_narrators rn LEFT JOIN narrators n ON n.rowah_id=rn.rowah_id
+        WHERE rn.rec_id=? ORDER BY rn.ord""", (rec_id,)).fetchall()
+    return {"rec_id": rec_id, "سلسلة_الرواة": [row_to_dict(x) for x in rows]}

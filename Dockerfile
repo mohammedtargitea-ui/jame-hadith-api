@@ -11,11 +11,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./
 
-# سحب القواعد من سلّة البيانات العامة في هوغنغ (مرة واحدة عند البناء، تُحفظ في الصورة)
+# سحب القاعدة المصلحة من سلّة البيانات العامة في هوغنغ (مرة واحدة عند البناء)
+# مع التحقق من الحجم بالبايت لضمان أنها النسخة المصلحة ذات الكيانات
 ARG DATA_BASE=https://huggingface.co/datasets/MoChihab/jame-hadith-data/resolve/main
-RUN curl -fsSL -o /app/rawi_index.db "$DATA_BASE/rawi_index.db" \
- && curl -fsSL -o /app/jame_analysis.db "$DATA_BASE/jame_analysis.db" \
- && curl -fsSL -o /app/jame_hadith.db "$DATA_BASE/jame_hadith.db" \
+RUN curl -fsSL -o /app/jama_hadith.sqlite "$DATA_BASE/jama_hadith.sqlite" \
+ && python3 -c "import os; s=os.path.getsize('/app/jama_hadith.sqlite'); print('DB size:', s); assert s == 1447137280, 'unexpected size %s' % s" \
  && ls -la /app
 
 ENV PORT=10000
